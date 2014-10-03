@@ -885,6 +885,12 @@
 	  (collecting p))
   (9 9 0 1))
 
+(deftest for.previous.var-with-type-declaration
+    (iter (for i from 1 to 5)
+          (for (the fixnum i-prev) previous i)
+	  (collect i-prev))
+  (nil 1 2 3 4))
+
 (deftest for.first.1
     (iter (for num in '(20 19 18 17 16))
 	  (for i first num then (1+ i))
@@ -1752,6 +1758,14 @@
 	     (multiplying (macrolet ((foo () 1))
 			    (foo))))
   1)
+
+(deftest bug/collect-at-beginning
+    (iterate
+      (for i from 1 to 10)
+      (if (oddp i)
+          (collect i :at :beginning)
+          (collect i)))
+  (9 7 5 3 1 2 4 6 8 10))
 
 ;; Hashtable iterators are specified to be defined as macrolets.
 ;; But we handle these by special-casing with-hash-table/package-iterator

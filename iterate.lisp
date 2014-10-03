@@ -462,29 +462,38 @@
 
   (defun sharpL-reader (stream subchar n-args)
     (declare (ignore subchar))
+    ;; Depending how an implementation chooses to expand `(,!1 (get-free-temp))
+    ;; at read-time, it might be a macro that must be expanded before groveling
+    ;; the resultant sexpr. Here it gets expanded in the null environment for
+    ;; lack of anything better. If the macro is sensitive to its lexical
+    ;; environment, it suggests perhaps an inappropriate use of #L.
+    ;; However, to support unforseen cases, we will use the original form as
+    ;; read for the resulting lambda's body. Moreover, rather than stuff new
+    ;; atoms into the body which is impossible if the representation is opaque,
+    ;; redirect "!" vars onto gensyms using SYMBOL-MACROLET.
     (let* ((form (read stream t nil t))
-	   (bang-vars (sort (bang-vars form) #'< :key #'bang-var-num))
-	   (bang-var-nums (mapcar #'bang-var-num bang-vars))
-	   (max-bv-num (if bang-vars
-			   (reduce #'max bang-var-nums :initial-value 0)
-			   0)))
-      (cond 
-	((null n-args)
-	 (setq n-args max-bv-num))
-	((< n-args max-bv-num)
-	 (error "#L: digit-string ~d specifies too few arguments" n-args)))
-      (let* ((bvars (let ((temp nil))
-		      (dotimes (i n-args (nreverse temp))
-			(push (make-bang-var (1+ i)) temp))))
-	     (args (mapcar #'(lambda (x) (declare (ignore x)) (gensym))
-			   bvars))
-	     (ignores (set-difference bvars bang-vars))
-	     (decl (if ignores `(declare (ignore .,ignores)) nil))
-	     (body (if (list-of-forms? form)
-		       (if decl (cons decl form) form)
-		       (if decl (list decl form) (list form))))
-	     (subbed-body (sublis (pairlis bvars args) body)))
-	`#'(lambda ,args ,.subbed-body))))
+	   (refd-!vars (sort (bang-vars (macroexpand form))
+                             #'< :key #'bang-var-num))
+	   (bang-var-nums (mapcar #'bang-var-num refd-!vars))
+	   (max-bv-num (if refd-!vars (car (last bang-var-nums)) 0)))
+      (cond ((null n-args)
+             (setq n-args max-bv-num))
+            ((< n-args max-bv-num)
+             (error "#L: digit-string ~d specifies too few arguments" n-args)))
+      (let* ((all-!vars (loop for i from 1 to n-args collect (make-bang-var i)))
+	     (formals (mapcar (lambda (x) (declare (ignore x)) (gensym))
+                              all-!vars)))
+	`#'(lambda ,formals
+             ,@(let ((ignore (mapcan (lambda (!var tempvar)
+                                       (unless (member !var refd-!vars)
+                                         (list tempvar)))
+                                     all-!vars formals)))
+                 (if ignore `((declare (ignore ,@ignore)))))
+             (symbol-macrolet ,(mapcan (lambda (!var tempvar)
+                                         (when (member !var refd-!vars)
+                                           (list (list !var tempvar))))
+                                       all-!vars formals)
+               ,@(if (list-of-forms? form) form (list form)))))))
 
   (defun make-bang-var (n)
     (intern (format nil "!~d" n)))
@@ -1319,9 +1328,13 @@ Evaluate (iterate:display-iterate-clauses) for an overview of clauses"
 	    (kw2 (clause-info-keywords ci2)))
 	(if (= insert-n 2)
 	    (rotatef kw1 kw2))
-	(error "Iterate: Inserting clause ~a would create ~
+	(restart-case
+            (error "Iterate: Inserting clause ~a would create ~
   an ambiguity with clause ~a"
-	       kw1 kw2))))
+                   kw1 kw2)
+          (delete-conflict ()
+            :report "Delete the original clause"
+            (remove-clause kw2))))))
 
 
 (defun ambiguous-clauses? (ci1 ci2)
@@ -2359,7 +2372,7 @@ e.g. (DSETQ (VALUES (a . b) nil c) form)"
 
 ;;; (IF-FIRST-TIME then &optional else)
 (def-special-clause if-first-time (then &optional else)
-  "Evaluate branch depending on whether this clause if met for the first time"
+  "Evaluate branch depending on whether this clause is met for the first time"
   (return-code :body (list
 		      (if-1st-time (list (walk-expr then))
 				   (if else (list (walk-expr else)))))))
@@ -3174,7 +3187,10 @@ e.g. (DSETQ (VALUES (a . b) nil c) form)"
 		    expr
 		    (make-application end-operation collect-var expr)))))
       (if (eq place 'start)
-	  (return-code :body `((setq ,collect-var ,op-expr)))
+          (return-code :body `((setq ,collect-var ,op-expr))
+                       :final (unless (eq result-type 'list)
+                                `((setq ,collect-var
+                                        (coerce ,collect-var ',result-type)))))
 	  (with-temporary temp-var
 	    ;; In the update code, must test if collect-var is null to allow
 	    ;; for other clauses to collect into same var.  This code
@@ -3345,14 +3361,16 @@ e.g. (DSETQ (VALUES (a . b) nil c) form)"
 ;;; generator, the best we can do is use a flag for the first time.
 
 ;;; (FOR PREVIOUS &optional INITIALLY BACK)
-(defclause (for pvar previous var &optional initially (default nil default?)
-					    back (n-expr 1))
+(defclause (for pvar-spec previous var &optional
+		initially (default nil default?) back (n-expr 1))
   "Previous value of a variable"
   ;; Set each save variable to the default in the initialization.
   (top-level-check)
   (if (not (constantp n-expr))
       (clause-error "~a should be a compile-time constant" n-expr))
-  (let ((n (eval n-expr))) ; Is this okay? It should be.
+
+  (let ((pvar (extract-var pvar-spec))
+	(n    (eval n-expr))) ; Is this okay? It should be.
     (if (not (and (integerp n) (> n 0)))
 	(clause-error "~a should be a positive integer" n-expr)
 	;; Here, n is a positive integer.
@@ -3365,7 +3383,7 @@ e.g. (DSETQ (VALUES (a . b) nil c) form)"
 	       (save-vars (cons pvar (make-save-vars var (1- n))))
 	       (inits (mapcar #L`(setq ,!1 ,iv-ref) save-vars)))
 	  (if temp (push `(setq ,temp ,init-val) inits))
-	  (make-default-binding pvar)
+	  (make-default-binding pvar-spec)
 	  (push (make-save-info :save-var pvar
 				:iv-ref iv-ref
 				:save-vars save-vars)
